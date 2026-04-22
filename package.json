@@ -1,0 +1,73 @@
+{
+  "name": "cfxlua-extended-vscode",
+  "displayName": "CfxLua Extended",
+  "description": "Modern CfxLua IntelliSense support for FiveM and RedM on top of Lua language tooling.",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.116.0"
+  },
+  "categories": [
+    "Linters",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "Lua",
+    "FiveM",
+    "RedM",
+    "CfxLua",
+    "IntelliSense"
+  ],
+  "activationEvents": [
+    "onLanguage:lua"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "cfxlua.game.gtav",
+        "title": "Use GTAV natives",
+        "category": "CfxLua"
+      },
+      {
+        "command": "cfxlua.game.rdr3",
+        "title": "Use RDR3 natives",
+        "category": "CfxLua"
+      }
+    ],
+    "configuration": {
+      "title": "CfxLua",
+      "properties": {
+        "cfxlua.game": {
+          "type": "string",
+          "default": "gtav",
+          "enum": [
+            "gtav",
+            "rdr3"
+          ],
+          "markdownDescription": "Select which native library set should be exposed to Lua tooling."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "bun run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "bun run compile && bun run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "extensionDependencies": [
+    "sumneko.lua"
+  ],
+  "devDependencies": {
+    "@types/vscode": "^1.116.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "typescript-eslint": "^8.56.1",
+    "eslint": "^9.39.3",
+    "typescript": "^5.9.3",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2"
+  }
+}

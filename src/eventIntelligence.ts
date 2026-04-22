@@ -21,6 +21,7 @@ const CODELENS_APIS = new Set<string>(EVENT_LISTENER_APIS);
 type EventOccurrenceKind = 'listener' | 'trigger';
 type EventApiName = (typeof EVENT_APIS)[number];
 type ExecutionSide = 'client' | 'server';
+type LuaQuote = '"' | "'";
 
 export interface EventOccurrence {
   name: string;
@@ -76,6 +77,20 @@ function decodeLuaStringLiteral(value: string): string {
         return group;
     }
   });
+}
+
+export function escapeLuaStringLiteral(value: string, quote: LuaQuote): string {
+  const escapedValue = value
+    .replace(/\\/g, '\\\\')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/\t/g, '\\t');
+
+  if (quote === '"') {
+    return escapedValue.replace(/"/g, '\\"');
+  }
+
+  return escapedValue.replace(/'/g, "\\'");
 }
 
 function buildEventPattern(api: EventApiName, quote: '"' | "'"): RegExp {
@@ -145,6 +160,10 @@ function areRelatedOccurrences(source: EventOccurrence, candidate: EventOccurren
 
 function getSideAwareMatches(source: EventOccurrence, matches: EventOccurrence[]): EventOccurrence[] {
   return matches.filter((candidate) => areRelatedOccurrences(source, candidate));
+}
+
+export function getRelatedEventOccurrences(source: EventOccurrence, matches: EventOccurrence[]): EventOccurrence[] {
+  return getSideAwareMatches(source, matches);
 }
 
 function getCurrentExecutionSides(api: EventApiName | undefined, scriptSide: ResourceScriptSide): ExecutionSide[] {
@@ -252,6 +271,41 @@ export function findEventOccurrenceAtPosition(
   const occurrences = extractEventOccurrences(document.getText(), document.uri, context);
 
   return occurrences.find((occurrence) => occurrence.range.contains(position));
+}
+
+function getLuaQuoteForOccurrence(document: vscode.TextDocument, occurrence: EventOccurrence): LuaQuote | undefined {
+  if (occurrence.range.start.character === 0) {
+    return undefined;
+  }
+
+  const quotePosition = occurrence.range.start.translate(0, -1);
+  const quoteCharacter = document.getText(new vscode.Range(quotePosition, occurrence.range.start));
+
+  if (quoteCharacter === '"' || quoteCharacter === "'") {
+    return quoteCharacter;
+  }
+
+  return undefined;
+}
+
+async function resolveEventTargetsAtPosition(
+  eventIndex: WorkspaceEventIndex,
+  document: vscode.TextDocument,
+  position: vscode.Position,
+): Promise<{ occurrence: EventOccurrence; relatedMatches: EventOccurrence[] } | undefined> {
+  const scriptSide = await eventIndex.getScriptSideForUri(document.uri);
+  const occurrence = findEventOccurrenceAtPosition(document, position, { scriptSide });
+
+  if (!occurrence) {
+    return undefined;
+  }
+
+  const matches = await eventIndex.getOccurrencesForName(occurrence.name);
+
+  return {
+    occurrence,
+    relatedMatches: getRelatedEventOccurrences(occurrence, matches),
+  };
 }
 
 export function isEventArgumentContext(document: vscode.TextDocument, position: vscode.Position): boolean {
@@ -539,20 +593,64 @@ export function registerEventIntelligence(context: vscode.ExtensionContext, even
 
   const referenceProvider = vscode.languages.registerReferenceProvider(selector, {
     async provideReferences(document, position, context) {
-      const scriptSide = await eventIndex.getScriptSideForUri(document.uri);
-      const occurrence = findEventOccurrenceAtPosition(document, position, { scriptSide });
+      const resolved = await resolveEventTargetsAtPosition(eventIndex, document, position);
 
-      if (!occurrence) {
+      if (!resolved) {
         return undefined;
       }
 
-      const matches = await eventIndex.getOccurrencesForName(occurrence.name);
-      const relatedMatches = getSideAwareMatches(occurrence, matches);
       const filteredMatches = context.includeDeclaration
-        ? relatedMatches
-        : relatedMatches.filter((match) => !isSameOccurrence(match, occurrence));
+        ? resolved.relatedMatches
+        : resolved.relatedMatches.filter((match) => !isSameOccurrence(match, resolved.occurrence));
 
       return createReferenceLocations(filteredMatches);
+    },
+  });
+
+  const renameProvider = vscode.languages.registerRenameProvider(selector, {
+    async prepareRename(document, position) {
+      const resolved = await resolveEventTargetsAtPosition(eventIndex, document, position);
+
+      if (!resolved) {
+        throw new Error('Rename is only available on FiveM event string literals.');
+      }
+
+      return {
+        range: resolved.occurrence.range,
+        placeholder: resolved.occurrence.name,
+      };
+    },
+
+    async provideRenameEdits(document, position, newName) {
+      const trimmedName = newName.trim();
+
+      if (trimmedName.length === 0) {
+        throw new Error('Event name cannot be empty.');
+      }
+
+      const resolved = await resolveEventTargetsAtPosition(eventIndex, document, position);
+
+      if (!resolved) {
+        return undefined;
+      }
+
+      const workspaceEdit = new vscode.WorkspaceEdit();
+      const documentsByUri = new Map<string, vscode.TextDocument>([[document.uri.toString(), document]]);
+
+      for (const match of resolved.relatedMatches) {
+        const key = match.uri.toString();
+        let targetDocument = documentsByUri.get(key);
+
+        if (!targetDocument) {
+          targetDocument = await vscode.workspace.openTextDocument(match.uri);
+          documentsByUri.set(key, targetDocument);
+        }
+
+        const quote = getLuaQuoteForOccurrence(targetDocument, match) ?? '"';
+        workspaceEdit.replace(match.uri, match.range, escapeLuaStringLiteral(trimmedName, quote));
+      }
+
+      return workspaceEdit;
     },
   });
 
@@ -600,6 +698,7 @@ export function registerEventIntelligence(context: vscode.ExtensionContext, even
     closeSubscription,
     completionProvider,
     referenceProvider,
+    renameProvider,
     codeLensProvider,
     showUsagesCommand,
     new vscode.Disposable(() => {

@@ -1,8 +1,11 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import {
+	escapeLuaStringLiteral,
 	extractEventOccurrences,
+	findEventOccurrenceAtPosition,
 	getResourceEventGroupsFromOccurrences,
+	getRelatedEventOccurrences,
 	getUsageGroupsForOccurrence,
 	isEventArgumentContext,
 } from '../eventIntelligence';
@@ -130,6 +133,47 @@ suite('CfxLua helpers', () => {
 				['Receiver', [['bank:close', 1], ['bank:open', 1]]],
 			],
 		);
+	});
+
+	test('findEventOccurrenceAtPosition identifies event string literal ranges for rename targets', async () => {
+		const document = await vscode.workspace.openTextDocument({
+			language: 'lua',
+			content: 'RegisterNetEvent("bank:open", function() end)',
+		});
+		const occurrence = findEventOccurrenceAtPosition(document, new vscode.Position(0, 19), { scriptSide: 'server' });
+
+		assert.ok(occurrence);
+		assert.strictEqual(occurrence?.name, 'bank:open');
+	});
+
+	test('getRelatedEventOccurrences keeps rename scope side-aware', () => {
+		const clientUri = vscode.Uri.file('/tmp/client.lua');
+		const serverUri = vscode.Uri.file('/tmp/server.lua');
+		const sourceOccurrences = extractEventOccurrences(
+			'TriggerServerEvent("bank:open")',
+			clientUri,
+			{ scriptSide: 'client' },
+		);
+		const matches = [
+			...sourceOccurrences,
+			...extractEventOccurrences('RegisterNetEvent("bank:open", function() end)', serverUri, { scriptSide: 'server' }),
+			...extractEventOccurrences('RegisterNetEvent("bank:open", function() end)', clientUri, { scriptSide: 'client' }),
+		];
+
+		const relatedMatches = getRelatedEventOccurrences(sourceOccurrences[0], matches);
+
+		assert.deepStrictEqual(
+			relatedMatches.map((occurrence) => [occurrence.uri.path, occurrence.scriptSide]),
+			[
+				['/tmp/client.lua', 'client'],
+				['/tmp/server.lua', 'server'],
+			],
+		);
+	});
+
+	test('escapeLuaStringLiteral preserves the original quote style for rename edits', () => {
+		assert.strictEqual(escapeLuaStringLiteral('bank:"open"', '"'), 'bank:\\"open\\"');
+		assert.strictEqual(escapeLuaStringLiteral("bank:'open'", "'"), "bank:\\'open\\'");
 	});
 
 	test('isEventArgumentContext detects unfinished first string arguments', async () => {

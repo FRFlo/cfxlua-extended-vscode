@@ -1,6 +1,11 @@
 import * as vscode from 'vscode';
 import { COMMAND_SHOW_EVENT_USAGES } from './constants';
-import { collectLuaFilesInDirectory, resolveSingleResourcesDirectory } from './resourceDiscovery';
+import {
+  collectResourceScriptEntries,
+  ResourceScriptEntry,
+  ResourceScriptSide,
+  resolveSingleResourcesDirectory,
+} from './resourceDiscovery';
 
 const EVENT_LISTENER_APIS = ['AddEventHandler', 'RegisterNetEvent', 'RegisterServerEvent'] as const;
 const EVENT_TRIGGER_APIS = [
@@ -15,6 +20,7 @@ const CODELENS_APIS = new Set<string>(EVENT_LISTENER_APIS);
 
 type EventOccurrenceKind = 'listener' | 'trigger';
 type EventApiName = (typeof EVENT_APIS)[number];
+type ExecutionSide = 'client' | 'server';
 
 export interface EventOccurrence {
   name: string;
@@ -22,11 +28,31 @@ export interface EventOccurrence {
   kind: EventOccurrenceKind;
   uri: vscode.Uri;
   range: vscode.Range;
+  resourceRoot?: vscode.Uri;
+  manifestUri?: vscode.Uri;
+  scriptSide: ResourceScriptSide;
 }
 
 interface EventIndexData {
   occurrences: EventOccurrence[];
   occurrencesByName: Map<string, EventOccurrence[]>;
+}
+
+export interface EventUsageGroup {
+  title: string;
+  locations: vscode.Location[];
+}
+
+export interface ResourceEventEntry {
+  name: string;
+  locations: vscode.Location[];
+}
+
+export interface ResourceEventGroup {
+  title: string;
+  kind: EventOccurrenceKind;
+  locations: vscode.Location[];
+  events: ResourceEventEntry[];
 }
 
 function escapeRegex(value: string): string {
@@ -78,7 +104,91 @@ function isSameOccurrence(left: EventOccurrence, right: EventOccurrence): boolea
     && left.api === right.api;
 }
 
-export function extractEventOccurrences(text: string, uri: vscode.Uri): EventOccurrence[] {
+function getExecutionSides(scriptSide: ResourceScriptSide): ExecutionSide[] {
+  if (scriptSide === 'client') {
+    return ['client'];
+  }
+
+  if (scriptSide === 'server') {
+    return ['server'];
+  }
+
+  return ['client', 'server'];
+}
+
+function getReachableSides(occurrence: EventOccurrence): ExecutionSide[] {
+  switch (occurrence.api) {
+    case 'TriggerServerEvent':
+    case 'TriggerLatentServerEvent':
+      return ['server'];
+    case 'TriggerClientEvent':
+    case 'TriggerLatentClientEvent':
+      return ['client'];
+    case 'TriggerEvent':
+      return getExecutionSides(occurrence.scriptSide);
+    default:
+      return getExecutionSides(occurrence.scriptSide);
+  }
+}
+
+function intersectsExecutionSides(left: ExecutionSide[], right: ExecutionSide[]): boolean {
+  return left.some((side) => right.includes(side));
+}
+
+function areRelatedOccurrences(source: EventOccurrence, candidate: EventOccurrence): boolean {
+  if (source.name !== candidate.name) {
+    return false;
+  }
+
+  return intersectsExecutionSides(getReachableSides(source), getReachableSides(candidate));
+}
+
+function getSideAwareMatches(source: EventOccurrence, matches: EventOccurrence[]): EventOccurrence[] {
+  return matches.filter((candidate) => areRelatedOccurrences(source, candidate));
+}
+
+function getCurrentExecutionSides(api: EventApiName | undefined, scriptSide: ResourceScriptSide): ExecutionSide[] {
+  if (!api) {
+    return getExecutionSides(scriptSide);
+  }
+
+  switch (api) {
+    case 'TriggerServerEvent':
+    case 'TriggerLatentServerEvent':
+      return ['server'];
+    case 'TriggerClientEvent':
+    case 'TriggerLatentClientEvent':
+      return ['client'];
+    default:
+      return getExecutionSides(scriptSide);
+  }
+}
+
+function getApiAtPosition(document: vscode.TextDocument, position: vscode.Position): EventApiName | undefined {
+  const occurrence = findEventOccurrenceAtPosition(document, position);
+
+  if (occurrence) {
+    return occurrence.api;
+  }
+
+  const offset = document.offsetAt(position);
+  const startOffset = Math.max(0, offset - 500);
+  const prefix = document.getText(new vscode.Range(document.positionAt(startOffset), position));
+
+  for (const api of EVENT_APIS) {
+    for (const quote of ['"', "'"] as const) {
+      const pattern = new RegExp(`\\b${escapeRegex(api)}\\s*\\(\\s*${quote === '"' ? '"' : "'"}(?:\\\\.|[^${quote}\\\\])*$`);
+
+      if (pattern.test(prefix)) {
+        return api;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+export function extractEventOccurrences(text: string, uri: vscode.Uri, context?: Partial<Pick<EventOccurrence, 'resourceRoot' | 'manifestUri' | 'scriptSide'>>): EventOccurrence[] {
   const occurrences: EventOccurrence[] = [];
 
   for (const api of EVENT_APIS) {
@@ -102,6 +212,9 @@ export function extractEventOccurrences(text: string, uri: vscode.Uri): EventOcc
           api,
           kind: getOccurrenceKind(api),
           uri,
+          resourceRoot: context?.resourceRoot,
+          manifestUri: context?.manifestUri,
+          scriptSide: context?.scriptSide ?? 'unknown',
           range: new vscode.Range(
             positionAt(text, nameStartOffset),
             positionAt(text, nameEndOffset),
@@ -131,8 +244,12 @@ function positionAt(text: string, offset: number): vscode.Position {
   return new vscode.Position(line, character);
 }
 
-export function findEventOccurrenceAtPosition(document: vscode.TextDocument, position: vscode.Position): EventOccurrence | undefined {
-  const occurrences = extractEventOccurrences(document.getText(), document.uri);
+export function findEventOccurrenceAtPosition(
+  document: vscode.TextDocument,
+  position: vscode.Position,
+  context?: Partial<Pick<EventOccurrence, 'resourceRoot' | 'manifestUri' | 'scriptSide'>>,
+): EventOccurrence | undefined {
+  const occurrences = extractEventOccurrences(document.getText(), document.uri, context);
 
   return occurrences.find((occurrence) => occurrence.range.contains(position));
 }
@@ -154,13 +271,23 @@ export function isEventArgumentContext(document: vscode.TextDocument, position: 
   return patterns.some((pattern) => pattern.test(prefix));
 }
 
-class WorkspaceEventIndex {
+function getRoleLabelForKind(kind: EventOccurrenceKind): string {
+  return kind === 'trigger' ? 'Emitter' : 'Receiver';
+}
+
+export class WorkspaceEventIndex {
+  private readonly onDidInvalidateEmitter = new vscode.EventEmitter<void>();
   private cachedIndex: EventIndexData | undefined;
   private scanPromise: Promise<EventIndexData> | undefined;
+  private cachedScriptsByUri: Map<string, ResourceScriptEntry> | undefined;
+
+  readonly onDidInvalidate = this.onDidInvalidateEmitter.event;
 
   invalidate(): void {
     this.cachedIndex = undefined;
     this.scanPromise = undefined;
+    this.cachedScriptsByUri = undefined;
+    this.onDidInvalidateEmitter.fire();
   }
 
   async getOccurrencesForName(name: string): Promise<EventOccurrence[]> {
@@ -171,6 +298,18 @@ class WorkspaceEventIndex {
   async getNames(): Promise<string[]> {
     const index = await this.getIndex();
     return [...index.occurrencesByName.keys()].sort((left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' }));
+  }
+
+  async getScriptSideForUri(uri: vscode.Uri): Promise<ResourceScriptSide> {
+    const index = await this.getIndex();
+    return this.cachedScriptsByUri?.get(uri.toString())?.scriptSide ?? (index.occurrences.find((occurrence) => occurrence.uri.toString() === uri.toString())?.scriptSide ?? 'unknown');
+  }
+
+  async getResourceEventGroups(resourceRoot: vscode.Uri): Promise<ResourceEventGroup[]> {
+    const index = await this.getIndex();
+    const resourceKey = resourceRoot.toString();
+    const occurrences = index.occurrences.filter((occurrence) => occurrence.resourceRoot?.toString() === resourceKey);
+    return getResourceEventGroupsFromOccurrences(occurrences);
   }
 
   private async getIndex(): Promise<EventIndexData> {
@@ -191,6 +330,7 @@ class WorkspaceEventIndex {
   private async scanWorkspace(): Promise<EventIndexData> {
     const occurrences: EventOccurrence[] = [];
     const scannedUris = new Set<string>();
+    const scriptsByUri = new Map<string, ResourceScriptEntry>();
 
     for (const folder of vscode.workspace.workspaceFolders ?? []) {
       const resolution = await resolveSingleResourcesDirectory(folder);
@@ -199,18 +339,19 @@ class WorkspaceEventIndex {
         continue;
       }
 
-      const luaFiles = await collectLuaFilesInDirectory(resolution.uri);
+      const scriptEntries = await collectResourceScriptEntries(resolution.uri);
 
-      for (const uri of luaFiles) {
-        const key = uri.toString();
+      for (const scriptEntry of scriptEntries) {
+        const key = scriptEntry.fileUri.toString();
 
         if (scannedUris.has(key)) {
           continue;
         }
 
         scannedUris.add(key);
-        const text = await readWorkspaceLuaText(uri);
-        occurrences.push(...extractEventOccurrences(text, uri));
+        scriptsByUri.set(key, scriptEntry);
+        const text = await readWorkspaceLuaText(scriptEntry.fileUri);
+        occurrences.push(...extractEventOccurrences(text, scriptEntry.fileUri, scriptEntry));
       }
     }
 
@@ -225,6 +366,8 @@ class WorkspaceEventIndex {
     for (const matches of occurrencesByName.values()) {
       matches.sort(compareOccurrences);
     }
+
+    this.cachedScriptsByUri = scriptsByUri;
 
     return {
       occurrences: occurrences.sort(compareOccurrences),
@@ -248,12 +391,72 @@ function createReferenceLocations(occurrences: EventOccurrence[]): vscode.Locati
   return occurrences.map((occurrence) => new vscode.Location(occurrence.uri, occurrence.range));
 }
 
-function pluralizeUsage(count: number): string {
-  return `${count} usage${count === 1 ? '' : 's'}`;
+function pluralizeCategory(count: number, singular: string, plural = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : plural}`;
 }
 
-export function registerEventIntelligence(context: vscode.ExtensionContext): vscode.Disposable[] {
-  const eventIndex = new WorkspaceEventIndex();
+function getCategoryLabel(kind: EventOccurrenceKind, similar: boolean): string {
+  if (similar) {
+    return getRoleLabelForKind(kind);
+  }
+
+  return getRoleLabelForKind(kind === 'listener' ? 'trigger' : 'listener');
+}
+
+export function getResourceEventGroupsFromOccurrences(occurrences: EventOccurrence[]): ResourceEventGroup[] {
+  const groups: ResourceEventGroup[] = [];
+
+  for (const kind of ['trigger', 'listener'] as const) {
+    const matches = occurrences.filter((occurrence) => occurrence.kind === kind);
+
+    if (matches.length === 0) {
+      continue;
+    }
+
+    const byName = new Map<string, EventOccurrence[]>();
+
+    for (const occurrence of matches) {
+      const current = byName.get(occurrence.name) ?? [];
+      current.push(occurrence);
+      byName.set(occurrence.name, current);
+    }
+
+    const events = [...byName.entries()]
+      .sort(([left], [right]) => left.localeCompare(right, undefined, { sensitivity: 'base' }))
+      .map(([name, eventOccurrences]) => ({
+        name,
+        locations: createReferenceLocations(eventOccurrences.sort(compareOccurrences)),
+      }));
+
+    groups.push({
+      title: getRoleLabelForKind(kind),
+      kind,
+      locations: createReferenceLocations(matches.sort(compareOccurrences)),
+      events,
+    });
+  }
+
+  return groups;
+}
+
+export function getUsageGroupsForOccurrence(source: EventOccurrence, matches: EventOccurrence[]): EventUsageGroup[] {
+  const relatedMatches = getSideAwareMatches(source, matches).filter((match) => !isSameOccurrence(match, source));
+  const similarMatches = relatedMatches.filter((match) => match.kind === source.kind);
+  const counterpartMatches = relatedMatches.filter((match) => match.kind !== source.kind);
+
+  return [
+    {
+      title: pluralizeCategory(similarMatches.length, getCategoryLabel(source.kind, true)),
+      locations: createReferenceLocations(similarMatches),
+    },
+    {
+      title: pluralizeCategory(counterpartMatches.length, getCategoryLabel(source.kind, false)),
+      locations: createReferenceLocations(counterpartMatches),
+    },
+  ];
+}
+
+export function registerEventIntelligence(context: vscode.ExtensionContext, eventIndex = new WorkspaceEventIndex()): vscode.Disposable[] {
   const selector: vscode.DocumentSelector = [{ language: 'lua' }];
   const watcherDisposables: vscode.Disposable[] = [];
 
@@ -314,9 +517,18 @@ export function registerEventIntelligence(context: vscode.ExtensionContext): vsc
         return undefined;
       }
 
+      const currentApi = getApiAtPosition(document, position);
+      const currentScriptSide = await eventIndex.getScriptSideForUri(document.uri);
+      const desiredSides = getCurrentExecutionSides(currentApi, currentScriptSide);
       const names = await eventIndex.getNames();
 
-      return names.map((name) => {
+      const filteredNames = await Promise.all(names.map(async (name) => {
+        const matches = await eventIndex.getOccurrencesForName(name);
+        const relevantMatches = matches.filter((match) => intersectsExecutionSides(getReachableSides(match), desiredSides));
+        return relevantMatches.length > 0 ? name : undefined;
+      }));
+
+      return filteredNames.filter((name): name is string => name !== undefined).map((name) => {
         const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Event);
         item.detail = 'Indexed FiveM event';
         item.insertText = name;
@@ -327,16 +539,18 @@ export function registerEventIntelligence(context: vscode.ExtensionContext): vsc
 
   const referenceProvider = vscode.languages.registerReferenceProvider(selector, {
     async provideReferences(document, position, context) {
-      const occurrence = findEventOccurrenceAtPosition(document, position);
+      const scriptSide = await eventIndex.getScriptSideForUri(document.uri);
+      const occurrence = findEventOccurrenceAtPosition(document, position, { scriptSide });
 
       if (!occurrence) {
         return undefined;
       }
 
       const matches = await eventIndex.getOccurrencesForName(occurrence.name);
+      const relatedMatches = getSideAwareMatches(occurrence, matches);
       const filteredMatches = context.includeDeclaration
-        ? matches
-        : matches.filter((match) => !isSameOccurrence(match, occurrence));
+        ? relatedMatches
+        : relatedMatches.filter((match) => !isSameOccurrence(match, occurrence));
 
       return createReferenceLocations(filteredMatches);
     },
@@ -344,34 +558,34 @@ export function registerEventIntelligence(context: vscode.ExtensionContext): vsc
 
   const codeLensProvider = vscode.languages.registerCodeLensProvider(selector, {
     async provideCodeLenses(document) {
-      const documentOccurrences = extractEventOccurrences(document.getText(), document.uri)
-        .filter((occurrence) => occurrence.kind === 'listener');
+      const scriptSide = await eventIndex.getScriptSideForUri(document.uri);
+      const documentOccurrences = extractEventOccurrences(document.getText(), document.uri, { scriptSide });
 
       if (documentOccurrences.length === 0) {
         return [];
       }
 
-      const lenses = await Promise.all(documentOccurrences.map(async (occurrence) => {
+      const groupedLenses = await Promise.all(documentOccurrences.map(async (occurrence) => {
         const matches = await eventIndex.getOccurrencesForName(occurrence.name);
-        const usages = matches.filter((match) => !isSameOccurrence(match, occurrence));
-        const locations = createReferenceLocations(usages);
+        const usageGroups = getUsageGroupsForOccurrence(occurrence, matches);
 
-        return new vscode.CodeLens(occurrence.range, {
-          title: pluralizeUsage(usages.length),
+        return usageGroups.map((group) => new vscode.CodeLens(occurrence.range, {
+          title: group.title,
           command: COMMAND_SHOW_EVENT_USAGES,
-          arguments: [occurrence.uri, occurrence.range.start, locations, occurrence.name],
-        });
+          arguments: [occurrence.uri, occurrence.range.start, group.locations, occurrence.name, group.title],
+        }));
       }));
 
-      return lenses;
+      return groupedLenses.flat();
     },
   });
 
   const showUsagesCommand = vscode.commands.registerCommand(
     COMMAND_SHOW_EVENT_USAGES,
-    async (uri: vscode.Uri, position: vscode.Position, locations: vscode.Location[], eventName: string) => {
+    async (uri: vscode.Uri, position: vscode.Position, locations: vscode.Location[], eventName: string, categoryTitle?: string) => {
       if (locations.length === 0) {
-        await vscode.window.showInformationMessage(`No indexed usages found for '${eventName}'.`);
+        const scope = categoryTitle ? categoryTitle.toLowerCase() : 'indexed usages';
+        await vscode.window.showInformationMessage(`No ${scope} found for '${eventName}'.`);
         return;
       }
 

@@ -8,7 +8,7 @@ import {
   RESOURCES_VIEW_ID,
 } from './constants';
 import { getSelectedGame } from './configuration';
-import { registerEventIntelligence } from './eventIntelligence';
+import { registerEventIntelligence, WorkspaceEventIndex } from './eventIntelligence';
 import { disableCfxLuaAddon, enableCfxLuaAddon } from './lifecycle';
 import { ResourcesTreeDataProvider } from './resourcesTreeDataProvider';
 
@@ -69,7 +69,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   await activateGame(installedStoragePath, getSelectedGame());
 
-  const resourcesTreeDataProvider = new ResourcesTreeDataProvider();
+  const eventIndex = new WorkspaceEventIndex();
+  const resourcesTreeDataProvider = new ResourcesTreeDataProvider(eventIndex);
   const resourcesTreeView = vscode.window.createTreeView(RESOURCES_VIEW_ID, {
     treeDataProvider: resourcesTreeDataProvider,
     showCollapseAll: true,
@@ -77,12 +78,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const resourcesMessageSubscription = resourcesTreeDataProvider.onDidChangeMessage((message) => {
     resourcesTreeView.message = message;
   });
+  const eventIndexSubscription = eventIndex.onDidInvalidate(() => {
+    resourcesTreeDataProvider.refresh();
+  });
 
   context.subscriptions.push(
     resourcesTreeView,
     resourcesMessageSubscription,
+    eventIndexSubscription,
     registerResourceWatchers(resourcesTreeDataProvider),
-    ...registerEventIntelligence(context),
+    ...registerEventIntelligence(context, eventIndex),
     vscode.commands.registerCommand(COMMAND_USE_GTAV, async () => {
       await activateGame(installedStoragePath!, 'GTAV');
       await vscode.window.showInformationMessage('CfxLua now uses GTAV natives.');

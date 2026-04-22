@@ -1,21 +1,25 @@
 import * as vscode from 'vscode';
 import {
   MULTIPLE_SERVERS_UNSUPPORTED_MESSAGE,
-  RESOURCE_MANIFEST_FILENAME,
 } from './constants';
+import { ResourceEventGroup, WorkspaceEventIndex } from './eventIntelligence';
 import {
+  hasResourceManifest,
   readChildDirectories,
   resolveSingleResourcesDirectory,
 } from './resourceDiscovery';
 
-type ResourceNodeKind = 'workspace' | 'folder' | 'resource';
+type ResourceNodeKind = 'workspace' | 'folder' | 'resource' | 'eventRoot' | 'eventGroup' | 'eventName';
 
 export interface ResourceTreeNode {
+  id: string;
   kind: ResourceNodeKind;
   label: string;
   originalName: string;
   uri: vscode.Uri;
   children: ResourceTreeNode[];
+  group?: ResourceEventGroup;
+  eventLocations?: vscode.Location[];
 }
 
 interface WorkspaceScanResult {
@@ -27,25 +31,21 @@ function compareNodes(left: ResourceTreeNode, right: ResourceTreeNode): number {
   return left.label.localeCompare(right.label, undefined, { sensitivity: 'base' });
 }
 
+function pluralizeUsage(count: number): string {
+  return `${count} ${count === 1 ? 'usage' : 'usages'}`;
+}
+
 export function sanitizeResourceSegment(name: string): string {
   const bracketMatch = /^\[(.+)\]$/.exec(name);
   return bracketMatch?.[1] ?? name;
 }
 
-async function hasManifestFile(uri: vscode.Uri): Promise<boolean> {
-  const entries = await vscode.workspace.fs.readDirectory(uri);
-
-  return entries.some(
-    ([entryName, entryType]) =>
-      entryType === vscode.FileType.File && entryName.toLowerCase() === RESOURCE_MANIFEST_FILENAME,
-  );
-}
-
 async function scanResourceSubtree(uri: vscode.Uri, name: string): Promise<ResourceTreeNode | undefined> {
-  const hasManifest = await hasManifestFile(uri);
+  const hasManifest = await hasResourceManifest(uri);
 
   if (hasManifest) {
     return {
+      id: uri.toString(),
       kind: 'resource',
       label: sanitizeResourceSegment(name),
       originalName: name,
@@ -67,6 +67,7 @@ async function scanResourceSubtree(uri: vscode.Uri, name: string): Promise<Resou
   }
 
   return {
+    id: uri.toString(),
     kind: 'folder',
     label: sanitizeResourceSegment(name),
     originalName: name,
@@ -113,6 +114,8 @@ export class ResourcesTreeDataProvider implements vscode.TreeDataProvider<Resour
   private scanPromise: Promise<ResourceTreeNode[]> | undefined;
   private viewMessage: string | undefined;
 
+  constructor(private readonly eventIndex: WorkspaceEventIndex) {}
+
   readonly onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event;
   readonly onDidChangeMessage = this.onDidChangeMessageEmitter.event;
 
@@ -123,27 +126,85 @@ export class ResourcesTreeDataProvider implements vscode.TreeDataProvider<Resour
   }
 
   getTreeItem(element: ResourceTreeNode): vscode.TreeItem {
-    const collapsibleState = element.children.length > 0
+    let collapsibleState = element.children.length > 0
       ? vscode.TreeItemCollapsibleState.Collapsed
       : vscode.TreeItemCollapsibleState.None;
 
+    if (element.kind === 'resource' || element.kind === 'eventRoot' || element.kind === 'eventGroup') {
+      collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
+    }
+
+    if (element.kind === 'eventName') {
+      collapsibleState = vscode.TreeItemCollapsibleState.None;
+    }
+
     const item = new vscode.TreeItem(element.label, collapsibleState);
-    item.id = element.uri.toString();
-    item.resourceUri = element.uri;
+    item.id = element.id;
     item.contextValue = element.kind;
-    item.tooltip = new vscode.MarkdownString([
-      `**${element.label}**`,
-      '',
-      element.uri.fsPath,
-    ].join('\n'));
-    item.description = element.kind === 'resource' ? 'resource' : undefined;
-    item.iconPath = new vscode.ThemeIcon('folder');
+
+    switch (element.kind) {
+      case 'workspace':
+      case 'folder':
+      case 'resource': {
+        item.resourceUri = element.uri;
+        item.tooltip = new vscode.MarkdownString([
+          `**${element.label}**`,
+          '',
+          element.uri.fsPath,
+        ].join('\n'));
+        item.description = element.kind === 'resource' ? 'resource' : undefined;
+        item.iconPath = new vscode.ThemeIcon('folder');
+        break;
+      }
+      case 'eventRoot': {
+        item.tooltip = new vscode.MarkdownString('**Triggers**\n\nIndexed event usage groups for this resource.');
+        item.iconPath = new vscode.ThemeIcon('symbol-event');
+        break;
+      }
+      case 'eventGroup': {
+        item.tooltip = new vscode.MarkdownString(`**${element.label}**\n\n${element.group?.events.length ?? 0} indexed events`);
+        item.description = pluralizeUsage(element.group?.locations.length ?? 0);
+        item.iconPath = new vscode.ThemeIcon(element.group?.kind === 'trigger' ? 'arrow-up' : 'arrow-down');
+        break;
+      }
+      case 'eventName': {
+        item.tooltip = new vscode.MarkdownString([
+          `**${element.label}**`,
+          '',
+          pluralizeUsage(element.eventLocations?.length ?? 0),
+        ].join('\n'));
+        item.description = pluralizeUsage(element.eventLocations?.length ?? 0);
+        item.iconPath = new vscode.ThemeIcon('symbol-event');
+
+        if (element.eventLocations && element.eventLocations.length > 0) {
+          const [firstLocation] = element.eventLocations;
+          item.command = {
+            title: 'Show event usages',
+            command: 'editor.action.showReferences',
+            arguments: [firstLocation.uri, firstLocation.range.start, element.eventLocations],
+          };
+        }
+        break;
+      }
+    }
 
     return item;
   }
 
   async getChildren(element?: ResourceTreeNode): Promise<ResourceTreeNode[]> {
     if (element) {
+      if (element.kind === 'resource') {
+        return this.getResourceChildren(element);
+      }
+
+      if (element.kind === 'eventRoot') {
+        return this.getEventGroupNodes(element);
+      }
+
+      if (element.kind === 'eventGroup') {
+        return this.getEventNameNodes(element);
+      }
+
       return element.children;
     }
 
@@ -195,6 +256,7 @@ export class ResourcesTreeDataProvider implements vscode.TreeDataProvider<Resour
           }
 
           const workspaceNode: ResourceTreeNode = {
+            id: folder.uri.toString(),
             kind: 'workspace',
             label: sanitizeResourceSegment(folder.name),
             originalName: folder.name,
@@ -221,5 +283,58 @@ export class ResourcesTreeDataProvider implements vscode.TreeDataProvider<Resour
 
     this.viewMessage = message;
     this.onDidChangeMessageEmitter.fire(message);
+  }
+
+  private async getResourceChildren(resourceNode: ResourceTreeNode): Promise<ResourceTreeNode[]> {
+    const eventGroups = await this.eventIndex.getResourceEventGroups(resourceNode.uri);
+    const hasEmitterGroup = eventGroups.some((group) => group.kind === 'trigger');
+
+    if (!hasEmitterGroup) {
+      return resourceNode.children;
+    }
+
+    return [
+      ...resourceNode.children,
+      {
+        id: `${resourceNode.id}#triggers`,
+        kind: 'eventRoot',
+        label: 'Triggers',
+        originalName: 'Triggers',
+        uri: resourceNode.uri,
+        children: [],
+      },
+    ];
+  }
+
+  private async getEventGroupNodes(eventRootNode: ResourceTreeNode): Promise<ResourceTreeNode[]> {
+    const groups = await this.eventIndex.getResourceEventGroups(eventRootNode.uri);
+
+    return groups.map((group) => ({
+      id: `${eventRootNode.id}/${group.kind}`,
+      kind: 'eventGroup',
+      label: group.title,
+      originalName: group.title,
+      uri: eventRootNode.uri,
+      children: [],
+      group,
+    }));
+  }
+
+  private getEventNameNodes(eventGroupNode: ResourceTreeNode): ResourceTreeNode[] {
+    const group = eventGroupNode.group;
+
+    if (!group) {
+      return [];
+    }
+
+    return group.events.map((eventEntry) => ({
+      id: `${eventGroupNode.id}/${eventEntry.name}`,
+      kind: 'eventName',
+      label: eventEntry.name,
+      originalName: eventEntry.name,
+      uri: eventGroupNode.uri,
+      children: [],
+      eventLocations: eventEntry.locations,
+    }));
   }
 }

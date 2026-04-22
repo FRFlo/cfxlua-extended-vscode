@@ -42,6 +42,7 @@ export const IGNORED_DIRECTORIES = [
 ] as const;
 
 export const RESOURCE_MANIFEST_FILENAME = 'fxmanifest.lua';
+export const LEGACY_RESOURCE_MANIFEST_FILENAME = '__resource.lua';
 export const RESOURCE_DIRECTORY_NAME = 'resources';
 export const MULTIPLE_SERVERS_UNSUPPORTED_MESSAGE = "Multiple servers aren't supported yet";
 

@@ -1,11 +1,13 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import {
-  extractEventOccurrences,
-  isEventArgumentContext,
+	extractEventOccurrences,
+	getResourceEventGroupsFromOccurrences,
+	getUsageGroupsForOccurrence,
+	isEventArgumentContext,
 } from '../eventIntelligence';
 import { normalizeGame } from '../game';
-import { isResourcesDirectoryName } from '../resourceDiscovery';
+import { inferScriptSide, isResourcesDirectoryName } from '../resourceDiscovery';
 import { sanitizeResourceSegment } from '../resourcesTreeDataProvider';
 
 suite('CfxLua helpers', () => {
@@ -45,6 +47,87 @@ suite('CfxLua helpers', () => {
 				['RegisterNetEvent', 'listener', 'bank:open'],
 				['AddEventHandler', 'listener', 'bank:open'],
 				['TriggerServerEvent', 'trigger', 'bank:open'],
+			],
+		);
+	});
+
+	test('extractEventOccurrences keeps manifest-derived script side', () => {
+		const uri = vscode.Uri.file('/tmp/client.lua');
+		const [occurrence] = extractEventOccurrences(
+			'TriggerClientEvent("bank:open", -1)',
+			uri,
+			{ scriptSide: 'server' },
+		);
+
+		assert.strictEqual(occurrence.scriptSide, 'server');
+	});
+
+	test('inferScriptSide maps client, server and shared scripts from fxmanifest', () => {
+		const manifest = [
+			"client_scripts {'client/*.lua'}",
+			"server_script 'server/main.lua'",
+			"shared_script 'shared/init.lua'",
+		].join('\n');
+
+		assert.strictEqual(inferScriptSide('client/ui.lua', manifest), 'client');
+		assert.strictEqual(inferScriptSide('server/main.lua', manifest), 'server');
+		assert.strictEqual(inferScriptSide('shared/init.lua', manifest), 'shared');
+		assert.strictEqual(inferScriptSide('misc/extra.lua', manifest), 'unknown');
+	});
+
+	test('getUsageGroupsForOccurrence splits similar handlers from triggers', () => {
+		const uri = vscode.Uri.file('/tmp/server.lua');
+		const occurrences = extractEventOccurrences([
+			'RegisterNetEvent("bank:open", function() end)',
+			'AddEventHandler("bank:open", function() end)',
+			'TriggerEvent("bank:open")',
+		].join('\n'), uri, { scriptSide: 'server' });
+		const source = occurrences[0];
+		const groups = getUsageGroupsForOccurrence(source, occurrences);
+
+		assert.deepStrictEqual(
+			groups.map((group) => [group.title, group.locations.length]),
+			[
+				['1 Receiver', 1],
+				['1 Emitter', 1],
+			],
+		);
+	});
+
+	test('getUsageGroupsForOccurrence splits similar triggers from handlers', () => {
+		const uri = vscode.Uri.file('/tmp/server.lua');
+		const occurrences = extractEventOccurrences([
+			'RegisterNetEvent("bank:open", function() end)',
+			'TriggerEvent("bank:open")',
+			'TriggerEvent("bank:open")',
+		].join('\n'), uri, { scriptSide: 'server' });
+		const source = occurrences[1];
+		const groups = getUsageGroupsForOccurrence(source, occurrences);
+
+		assert.deepStrictEqual(
+			groups.map((group) => [group.title, group.locations.length]),
+			[
+				['1 Emitter', 1],
+				['1 Receiver', 1],
+			],
+		);
+	});
+
+	test('getResourceEventGroupsFromOccurrences groups resource events into emitter and receiver buckets', () => {
+		const uri = vscode.Uri.file('/tmp/server.lua');
+		const occurrences = extractEventOccurrences([
+			'TriggerEvent("bank:open")',
+			'TriggerEvent("bank:open")',
+			'RegisterNetEvent("bank:open", function() end)',
+			'AddEventHandler("bank:close", function() end)',
+		].join('\n'), uri, { scriptSide: 'server', resourceRoot: vscode.Uri.file('/tmp/resource') });
+		const groups = getResourceEventGroupsFromOccurrences(occurrences);
+
+		assert.deepStrictEqual(
+			groups.map((group) => [group.title, group.events.map((eventEntry) => [eventEntry.name, eventEntry.locations.length])]),
+			[
+				['Emitter', [['bank:open', 2]]],
+				['Receiver', [['bank:close', 1], ['bank:open', 1]]],
 			],
 		);
 	});

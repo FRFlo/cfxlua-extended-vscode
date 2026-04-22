@@ -4,6 +4,7 @@ export const EXTENSION_NAME = 'cfxlua-extended-vscode';
 export const COMMAND_USE_GTAV = 'cfxlua.game.gtav';
 export const COMMAND_USE_RDR3 = 'cfxlua.game.rdr3';
 export const COMMAND_REFRESH_RESOURCES = 'cfxlua.resources.refresh';
+export const COMMAND_SHOW_EVENT_USAGES = 'cfxlua.events.showUsages';
 
 export const RESOURCES_VIEW_CONTAINER_ID = 'cfxlua-resources';
 export const RESOURCES_VIEW_ID = 'cfxlua-resources-view';

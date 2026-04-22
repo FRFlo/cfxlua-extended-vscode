@@ -8,6 +8,7 @@ import {
   RESOURCES_VIEW_ID,
 } from './constants';
 import { getSelectedGame } from './configuration';
+import { registerEventIntelligence } from './eventIntelligence';
 import { disableCfxLuaAddon, enableCfxLuaAddon } from './lifecycle';
 import { ResourcesTreeDataProvider } from './resourcesTreeDataProvider';
 
@@ -81,6 +82,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     resourcesTreeView,
     resourcesMessageSubscription,
     registerResourceWatchers(resourcesTreeDataProvider),
+    ...registerEventIntelligence(context),
     vscode.commands.registerCommand(COMMAND_USE_GTAV, async () => {
       await activateGame(installedStoragePath!, 'GTAV');
       await vscode.window.showInformationMessage('CfxLua now uses GTAV natives.');

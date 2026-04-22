@@ -1,10 +1,12 @@
 import * as vscode from 'vscode';
 import {
   MULTIPLE_SERVERS_UNSUPPORTED_MESSAGE,
-  RESOURCE_DIRECTORY_NAME,
   RESOURCE_MANIFEST_FILENAME,
-  RESOURCE_SCAN_EXCLUDED_DIRECTORIES,
 } from './constants';
+import {
+  readChildDirectories,
+  resolveSingleResourcesDirectory,
+} from './resourceDiscovery';
 
 type ResourceNodeKind = 'workspace' | 'folder' | 'resource';
 
@@ -25,35 +27,9 @@ function compareNodes(left: ResourceTreeNode, right: ResourceTreeNode): number {
   return left.label.localeCompare(right.label, undefined, { sensitivity: 'base' });
 }
 
-function isExcludedDirectory(name: string): boolean {
-  return RESOURCE_SCAN_EXCLUDED_DIRECTORIES.includes(name as (typeof RESOURCE_SCAN_EXCLUDED_DIRECTORIES)[number]);
-}
-
 export function sanitizeResourceSegment(name: string): string {
   const bracketMatch = /^\[(.+)\]$/.exec(name);
   return bracketMatch?.[1] ?? name;
-}
-
-export function isResourcesDirectoryName(name: string): boolean {
-  return name === RESOURCE_DIRECTORY_NAME;
-}
-
-async function readDirectoryEntries(uri: vscode.Uri): Promise<readonly [string, vscode.FileType][]> {
-  return vscode.workspace.fs.readDirectory(uri);
-}
-
-async function readChildDirectories(uri: vscode.Uri): Promise<Array<{ name: string; uri: vscode.Uri }>> {
-  const entries = await readDirectoryEntries(uri);
-
-  return entries
-    .filter(
-      ([entryName, entryType]) =>
-        entryType === vscode.FileType.Directory && !isExcludedDirectory(entryName),
-    )
-    .map(([entryName]) => ({
-      name: entryName,
-      uri: vscode.Uri.joinPath(uri, entryName),
-    }));
 }
 
 async function hasManifestFile(uri: vscode.Uri): Promise<boolean> {
@@ -99,26 +75,6 @@ async function scanResourceSubtree(uri: vscode.Uri, name: string): Promise<Resou
   };
 }
 
-async function resolveResourcesDirectories(folder: vscode.WorkspaceFolder): Promise<vscode.Uri[]> {
-  const directories = await readChildDirectories(folder.uri);
-  const candidates = directories
-    .filter((directory) => isResourcesDirectoryName(directory.name))
-    .map((directory) => directory.uri);
-
-  const nestedCandidates = await Promise.all(
-    directories
-      .filter((directory) => directory.name !== RESOURCE_DIRECTORY_NAME)
-      .map(async (directory) => {
-        const childDirectories = await readChildDirectories(directory.uri);
-        const resourcesDirectory = childDirectories.find((child) => isResourcesDirectoryName(child.name));
-
-        return resourcesDirectory?.uri;
-      }),
-  );
-
-  return [...candidates, ...nestedCandidates.filter((uri): uri is vscode.Uri => uri !== undefined)];
-}
-
 async function scanResourcesDirectory(resourcesDirectory: vscode.Uri): Promise<ResourceTreeNode[]> {
   const childDirectories = await readChildDirectories(resourcesDirectory);
 
@@ -132,13 +88,13 @@ async function scanResourcesDirectory(resourcesDirectory: vscode.Uri): Promise<R
 }
 
 async function scanWorkspaceFolder(folder: vscode.WorkspaceFolder): Promise<WorkspaceScanResult> {
-  const resourcesDirectories = await resolveResourcesDirectories(folder);
+  const resolution = await resolveSingleResourcesDirectory(folder);
 
-  if (resourcesDirectories.length === 0) {
+  if (!resolution.uri && !resolution.message) {
     return { nodes: [] };
   }
 
-  if (resourcesDirectories.length > 1) {
+  if (resolution.message === MULTIPLE_SERVERS_UNSUPPORTED_MESSAGE) {
     return {
       nodes: [],
       message: MULTIPLE_SERVERS_UNSUPPORTED_MESSAGE,
@@ -146,7 +102,7 @@ async function scanWorkspaceFolder(folder: vscode.WorkspaceFolder): Promise<Work
   }
 
   return {
-    nodes: await scanResourcesDirectory(resourcesDirectories[0]),
+    nodes: await scanResourcesDirectory(resolution.uri!),
   };
 }
 

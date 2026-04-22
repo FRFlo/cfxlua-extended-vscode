@@ -32,8 +32,39 @@
         "command": "cfxlua.game.rdr3",
         "title": "Use RDR3 natives",
         "category": "CfxLua"
+      },
+      {
+        "command": "cfxlua.resources.refresh",
+        "title": "Refresh Resources",
+        "category": "CfxLua"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cfxlua-resources",
+          "title": "Resources Explorer",
+          "icon": "media/cfxlua-resources.svg"
+        }
+      ]
+    },
+    "views": {
+      "cfxlua-resources": [
+        {
+          "id": "cfxlua-resources-view",
+          "name": "Resources"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "cfxlua.resources.refresh",
+          "when": "view == cfxlua-resources-view",
+          "group": "navigation"
+        }
+      ]
+    },
     "configuration": {
       "title": "CfxLua",
       "properties": {

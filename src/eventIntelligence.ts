@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { COMMAND_SHOW_EVENT_USAGES } from './constants';
+import { createLineStarts, findLuaCalls } from './luaCallParsing';
 import {
   collectResourceScriptEntries,
   ResourceScriptEntry,
@@ -17,11 +18,16 @@ const EVENT_TRIGGER_APIS = [
 ] as const;
 const EVENT_APIS = [...EVENT_LISTENER_APIS, ...EVENT_TRIGGER_APIS] as const;
 const CODELENS_APIS = new Set<string>(EVENT_LISTENER_APIS);
+const EVENT_API_SET = new Set<string>(EVENT_APIS);
 
 type EventOccurrenceKind = 'listener' | 'trigger';
 type EventApiName = (typeof EVENT_APIS)[number];
 type ExecutionSide = 'client' | 'server';
 type LuaQuote = '"' | "'";
+
+function isSupportedEventStringQuote(quote: '"' | "'" | '['): quote is LuaQuote {
+  return quote === '"' || quote === "'";
+}
 
 export interface EventOccurrence {
   name: string;
@@ -56,27 +62,8 @@ export interface ResourceEventGroup {
   events: ResourceEventEntry[];
 }
 
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 function getOccurrenceKind(api: EventApiName): EventOccurrenceKind {
   return CODELENS_APIS.has(api) ? 'listener' : 'trigger';
-}
-
-function decodeLuaStringLiteral(value: string): string {
-  return value.replace(/\\([\\'"nrt])/g, (_match, group: string) => {
-    switch (group) {
-      case 'n':
-        return '\n';
-      case 'r':
-        return '\r';
-      case 't':
-        return '\t';
-      default:
-        return group;
-    }
-  });
 }
 
 export function escapeLuaStringLiteral(value: string, quote: LuaQuote): string {
@@ -91,11 +78,6 @@ export function escapeLuaStringLiteral(value: string, quote: LuaQuote): string {
   }
 
   return escapedValue.replace(/'/g, "\\'");
-}
-
-function buildEventPattern(api: EventApiName, quote: '"' | "'"): RegExp {
-  const contentPattern = quote === '"' ? '"((?:\\\\.|[^"\\\\])*)"' : "'((?:\\\\.|[^'\\\\])*)'";
-  return new RegExp(`\\b${escapeRegex(api)}\\s*\\(\\s*${contentPattern}`, 'g');
 }
 
 function compareOccurrences(left: EventOccurrence, right: EventOccurrence): number {
@@ -183,6 +165,26 @@ function getCurrentExecutionSides(api: EventApiName | undefined, scriptSide: Res
   }
 }
 
+function isOffsetInsideStringArgument(start: number, end: number, offset: number): boolean {
+  return offset >= start && offset <= end;
+}
+
+function getEventApiAtOffset(text: string, offset: number): EventApiName | undefined {
+  for (const call of findLuaCalls(text, EVENT_API_SET)) {
+    const firstArgument = call.arguments[0];
+
+    if (firstArgument?.kind !== 'string' || !isSupportedEventStringQuote(firstArgument.literal.quote)) {
+      continue;
+    }
+
+    if (isOffsetInsideStringArgument(firstArgument.literal.contentStart, firstArgument.literal.contentEnd, offset)) {
+      return call.name as EventApiName;
+    }
+  }
+
+  return undefined;
+}
+
 function getApiAtPosition(document: vscode.TextDocument, position: vscode.Position): EventApiName | undefined {
   const occurrence = findEventOccurrenceAtPosition(document, position);
 
@@ -190,77 +192,64 @@ function getApiAtPosition(document: vscode.TextDocument, position: vscode.Positi
     return occurrence.api;
   }
 
-  const offset = document.offsetAt(position);
-  const startOffset = Math.max(0, offset - 500);
-  const prefix = document.getText(new vscode.Range(document.positionAt(startOffset), position));
-
-  for (const api of EVENT_APIS) {
-    for (const quote of ['"', "'"] as const) {
-      const pattern = new RegExp(`\\b${escapeRegex(api)}\\s*\\(\\s*${quote === '"' ? '"' : "'"}(?:\\\\.|[^${quote}\\\\])*$`);
-
-      if (pattern.test(prefix)) {
-        return api;
-      }
-    }
-  }
-
-  return undefined;
+  return getEventApiAtOffset(document.getText(), document.offsetAt(position));
 }
 
 export function extractEventOccurrences(text: string, uri: vscode.Uri, context?: Partial<Pick<EventOccurrence, 'resourceRoot' | 'manifestUri' | 'scriptSide'>>): EventOccurrence[] {
   const occurrences: EventOccurrence[] = [];
 
-  for (const api of EVENT_APIS) {
-    for (const quote of ['"', "'"] as const) {
-      const pattern = buildEventPattern(api, quote);
+  const lineStarts = createLineStarts(text);
 
-      for (const match of text.matchAll(pattern)) {
-        const rawName = match[1];
+  for (const call of findLuaCalls(text, EVENT_API_SET)) {
+    const firstArgument = call.arguments[0];
 
-        if (rawName === undefined || match.index === undefined) {
-          continue;
-        }
-
-        const matchedText = match[0];
-        const quoteIndex = matchedText.indexOf(quote);
-        const nameStartOffset = match.index + quoteIndex + 1;
-        const nameEndOffset = nameStartOffset + rawName.length;
-
-        occurrences.push({
-          name: decodeLuaStringLiteral(rawName),
-          api,
-          kind: getOccurrenceKind(api),
-          uri,
-          resourceRoot: context?.resourceRoot,
-          manifestUri: context?.manifestUri,
-          scriptSide: context?.scriptSide ?? 'unknown',
-          range: new vscode.Range(
-            positionAt(text, nameStartOffset),
-            positionAt(text, nameEndOffset),
-          ),
-        });
-      }
+    if (firstArgument?.kind !== 'string' || !isSupportedEventStringQuote(firstArgument.literal.quote)) {
+      continue;
     }
+
+    const api = call.name as EventApiName;
+    occurrences.push({
+      name: firstArgument.literal.value,
+      api,
+      kind: getOccurrenceKind(api),
+      uri,
+      resourceRoot: context?.resourceRoot,
+      manifestUri: context?.manifestUri,
+      scriptSide: context?.scriptSide ?? 'unknown',
+      range: new vscode.Range(
+        positionAt(lineStarts, firstArgument.literal.contentStart),
+        positionAt(lineStarts, firstArgument.literal.contentEnd),
+      ),
+    });
   }
 
   return occurrences.sort(compareOccurrences);
 }
 
-function positionAt(text: string, offset: number): vscode.Position {
-  let line = 0;
-  let character = 0;
+function positionAt(lineStarts: number[], offset: number): vscode.Position {
+  let low = 0;
+  let high = lineStarts.length - 1;
 
-  for (let index = 0; index < offset; index += 1) {
-    if (text[index] === '\n') {
-      line += 1;
-      character = 0;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const start = lineStarts[middle];
+    const nextStart = lineStarts[middle + 1] ?? Number.MAX_SAFE_INTEGER;
+
+    if (offset < start) {
+      high = middle - 1;
       continue;
     }
 
-    character += 1;
+    if (offset >= nextStart) {
+      low = middle + 1;
+      continue;
+    }
+
+    return new vscode.Position(middle, offset - start);
   }
 
-  return new vscode.Position(line, character);
+  const lastLine = lineStarts.length - 1;
+  return new vscode.Position(lastLine, offset - lineStarts[lastLine]);
 }
 
 export function findEventOccurrenceAtPosition(
@@ -313,16 +302,7 @@ export function isEventArgumentContext(document: vscode.TextDocument, position: 
     return true;
   }
 
-  const offset = document.offsetAt(position);
-  const startOffset = Math.max(0, offset - 500);
-  const prefix = document.getText(new vscode.Range(document.positionAt(startOffset), position));
-  const apiPattern = EVENT_APIS.map(escapeRegex).join('|');
-  const patterns = [
-    new RegExp(`\\b(?:${apiPattern})\\s*\\(\\s*"(?:\\\\.|[^"\\\\])*$`),
-    new RegExp(`\\b(?:${apiPattern})\\s*\\(\\s*'(?:\\\\.|[^'\\\\])*$`),
-  ];
-
-  return patterns.some((pattern) => pattern.test(prefix));
+  return getEventApiAtOffset(document.getText(), document.offsetAt(position)) !== undefined;
 }
 
 function getRoleLabelForKind(kind: EventOccurrenceKind): string {

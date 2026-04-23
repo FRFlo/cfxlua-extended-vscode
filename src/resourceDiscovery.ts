@@ -6,6 +6,7 @@ import {
   RESOURCE_MANIFEST_FILENAME,
   RESOURCE_SCAN_EXCLUDED_DIRECTORIES,
 } from './constants';
+import { findLuaCalls, getTopLevelArgumentStringValues } from './luaCallParsing';
 
 export interface ResolvedResourcesDirectory {
   uri?: vscode.Uri;
@@ -22,9 +23,14 @@ export interface ResourceScriptEntry {
 }
 
 interface ParsedManifestScripts {
-  client: string[];
-  server: string[];
-  shared: string[];
+  client: ManifestScriptPattern[];
+  server: ManifestScriptPattern[];
+  shared: ManifestScriptPattern[];
+}
+
+interface ManifestScriptPattern {
+  raw: string;
+  regex?: RegExp;
 }
 
 const RESOURCE_MANIFEST_FILENAMES = [RESOURCE_MANIFEST_FILENAME, LEGACY_RESOURCE_MANIFEST_FILENAME] as const;
@@ -33,6 +39,11 @@ const MANIFEST_SCRIPT_DIRECTIVES = {
   server: ['server_script', 'server_scripts'],
   shared: ['shared_script', 'shared_scripts'],
 } as const;
+const MANIFEST_SCRIPT_DIRECTIVE_SET = new Set<string>([
+  ...MANIFEST_SCRIPT_DIRECTIVES.client,
+  ...MANIFEST_SCRIPT_DIRECTIVES.server,
+  ...MANIFEST_SCRIPT_DIRECTIVES.shared,
+]);
 
 function isExcludedDirectory(name: string): boolean {
   return RESOURCE_SCAN_EXCLUDED_DIRECTORIES.includes(name as (typeof RESOURCE_SCAN_EXCLUDED_DIRECTORIES)[number]);
@@ -81,106 +92,6 @@ function globToRegExp(glob: string): RegExp {
   return new RegExp(pattern, 'i');
 }
 
-function extractQuotedStrings(text: string): string[] {
-  const matches = text.matchAll(/(['"])((?:\\.|(?!\1).)*)\1/g);
-  return [...matches].map((match) => match[2]).filter((value) => value.length > 0);
-}
-
-function readBalancedBlock(text: string, startIndex: number, openCharacter: string, closeCharacter: string): { value: string; nextIndex: number } {
-  let depth = 0;
-  let inString: '"' | "'" | undefined;
-  let isEscaped = false;
-
-  for (let index = startIndex; index < text.length; index += 1) {
-    const character = text[index];
-
-    if (inString) {
-      if (isEscaped) {
-        isEscaped = false;
-        continue;
-      }
-
-      if (character === '\\') {
-        isEscaped = true;
-        continue;
-      }
-
-      if (character === inString) {
-        inString = undefined;
-      }
-
-      continue;
-    }
-
-    if (character === '"' || character === "'") {
-      inString = character;
-      continue;
-    }
-
-    if (character === openCharacter) {
-      depth += 1;
-      continue;
-    }
-
-    if (character === closeCharacter) {
-      depth -= 1;
-
-      if (depth === 0) {
-        return {
-          value: text.slice(startIndex, index + 1),
-          nextIndex: index + 1,
-        };
-      }
-    }
-  }
-
-  return {
-    value: text.slice(startIndex),
-    nextIndex: text.length,
-  };
-}
-
-function parseDirectiveValues(text: string, startIndex: number): { values: string[]; nextIndex: number } {
-  let index = startIndex;
-
-  while (index < text.length && /\s/.test(text[index])) {
-    index += 1;
-  }
-
-  const character = text[index];
-
-  if (character === '"' || character === "'") {
-    const values = extractQuotedStrings(text.slice(index, text.indexOf('\n', index) === -1 ? text.length : text.indexOf('\n', index)));
-    return {
-      values,
-      nextIndex: text.indexOf('\n', index) === -1 ? text.length : text.indexOf('\n', index),
-    };
-  }
-
-  if (character === '{') {
-    const block = readBalancedBlock(text, index, '{', '}');
-    return {
-      values: extractQuotedStrings(block.value),
-      nextIndex: block.nextIndex,
-    };
-  }
-
-  if (character === '(') {
-    const block = readBalancedBlock(text, index, '(', ')');
-    return {
-      values: extractQuotedStrings(block.value),
-      nextIndex: block.nextIndex,
-    };
-  }
-
-  const lineEnd = text.indexOf('\n', index);
-  const line = text.slice(index, lineEnd === -1 ? text.length : lineEnd);
-  return {
-    values: extractQuotedStrings(line),
-    nextIndex: lineEnd === -1 ? text.length : lineEnd,
-  };
-}
-
 function parseManifestScripts(text: string): ParsedManifestScripts {
   const scripts: ParsedManifestScripts = {
     client: [],
@@ -188,27 +99,21 @@ function parseManifestScripts(text: string): ParsedManifestScripts {
     shared: [],
   };
 
-  const directivePattern = /\b(client_script|client_scripts|server_script|server_scripts|shared_script|shared_scripts)\b/g;
-  let match = directivePattern.exec(text);
+  for (const call of findLuaCalls(text, MANIFEST_SCRIPT_DIRECTIVE_SET)) {
+    const values = call.arguments.flatMap((argument) => getTopLevelArgumentStringValues(argument)).filter((value) => value.length > 0);
+    const patterns = values.map(createManifestScriptPattern);
 
-  while (match) {
-    const directive = match[1];
-    const result = parseDirectiveValues(text, match.index + directive.length);
-
-    if (MANIFEST_SCRIPT_DIRECTIVES.client.includes(directive as (typeof MANIFEST_SCRIPT_DIRECTIVES.client)[number])) {
-      scripts.client.push(...result.values);
+    if (MANIFEST_SCRIPT_DIRECTIVES.client.includes(call.name as (typeof MANIFEST_SCRIPT_DIRECTIVES.client)[number])) {
+      scripts.client.push(...patterns);
     }
 
-    if (MANIFEST_SCRIPT_DIRECTIVES.server.includes(directive as (typeof MANIFEST_SCRIPT_DIRECTIVES.server)[number])) {
-      scripts.server.push(...result.values);
+    if (MANIFEST_SCRIPT_DIRECTIVES.server.includes(call.name as (typeof MANIFEST_SCRIPT_DIRECTIVES.server)[number])) {
+      scripts.server.push(...patterns);
     }
 
-    if (MANIFEST_SCRIPT_DIRECTIVES.shared.includes(directive as (typeof MANIFEST_SCRIPT_DIRECTIVES.shared)[number])) {
-      scripts.shared.push(...result.values);
+    if (MANIFEST_SCRIPT_DIRECTIVES.shared.includes(call.name as (typeof MANIFEST_SCRIPT_DIRECTIVES.shared)[number])) {
+      scripts.shared.push(...patterns);
     }
-
-    directivePattern.lastIndex = result.nextIndex;
-    match = directivePattern.exec(text);
   }
 
   return scripts;
@@ -235,13 +140,20 @@ function determineScriptSide(relativePath: string, parsedManifest: ParsedManifes
   return 'unknown';
 }
 
-function matchesManifestScript(relativePath: string, manifestPattern: string): boolean {
-  if (manifestPattern.startsWith('@')) {
-    return false;
+function createManifestScriptPattern(value: string): ManifestScriptPattern {
+  if (value.startsWith('@')) {
+    return { raw: value };
   }
 
-  const normalizedPattern = normalizeResourcePath(manifestPattern);
-  return globToRegExp(normalizedPattern).test(relativePath);
+  const normalizedPattern = normalizeResourcePath(value);
+  return {
+    raw: value,
+    regex: globToRegExp(normalizedPattern),
+  };
+}
+
+function matchesManifestScript(relativePath: string, manifestPattern: ManifestScriptPattern): boolean {
+  return manifestPattern.regex?.test(relativePath) ?? false;
 }
 
 export function inferScriptSide(relativePath: string, manifestText: string): ResourceScriptSide {

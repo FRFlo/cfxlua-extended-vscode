@@ -65,6 +65,33 @@ suite('CfxLua helpers', () => {
 		assert.strictEqual(occurrence.scriptSide, 'server');
 	});
 
+	test('extractEventOccurrences ignores commented event APIs', () => {
+		const uri = vscode.Uri.file('/tmp/client.lua');
+		const occurrences = extractEventOccurrences([
+			'-- TriggerEvent("commented")',
+			'--[[ RegisterNetEvent("commented:block", function() end) ]]',
+			'TriggerEvent("live:event")',
+		].join('\n'), uri);
+
+		assert.deepStrictEqual(
+			occurrences.map((occurrence) => occurrence.name),
+			['live:event'],
+		);
+	});
+
+	test('extractEventOccurrences ignores long-bracket event literals for rename consistency', () => {
+		const uri = vscode.Uri.file('/tmp/client.lua');
+		const occurrences = extractEventOccurrences([
+			'TriggerEvent([[ignored:event]])',
+			'RegisterNetEvent("live:event", function() end)',
+		].join('\n'), uri);
+
+		assert.deepStrictEqual(
+			occurrences.map((occurrence) => occurrence.name),
+			['live:event'],
+		);
+	});
+
 	test('inferScriptSide maps client, server and shared scripts from fxmanifest', () => {
 		const manifest = [
 			"client_scripts {'client/*.lua'}",
@@ -76,6 +103,37 @@ suite('CfxLua helpers', () => {
 		assert.strictEqual(inferScriptSide('server/main.lua', manifest), 'server');
 		assert.strictEqual(inferScriptSide('shared/init.lua', manifest), 'shared');
 		assert.strictEqual(inferScriptSide('misc/extra.lua', manifest), 'unknown');
+	});
+
+	test('inferScriptSide handles commented and multiline manifest directives', () => {
+		const manifest = [
+			'-- client_script "ignored.lua"',
+			'client_scripts({',
+			"  'client/*.lua',",
+			'})',
+			'--[[ shared_script "ignored_shared.lua" ]]',
+			"shared_script 'shared/init.lua'",
+		].join('\n');
+
+		assert.strictEqual(inferScriptSide('client/main.lua', manifest), 'client');
+		assert.strictEqual(inferScriptSide('shared/init.lua', manifest), 'shared');
+		assert.strictEqual(inferScriptSide('ignored.lua', manifest), 'unknown');
+	});
+
+	test('inferScriptSide only uses top-level manifest table string entries', () => {
+		const manifest = [
+			'client_scripts({',
+			"  'client/*.lua',",
+			"  { 'nested/*.lua' },",
+			"  helper('generated/*.lua'),",
+			"  ['named'] = 'mapped/*.lua',",
+			'})',
+		].join('\n');
+
+		assert.strictEqual(inferScriptSide('client/main.lua', manifest), 'client');
+		assert.strictEqual(inferScriptSide('nested/file.lua', manifest), 'unknown');
+		assert.strictEqual(inferScriptSide('generated/file.lua', manifest), 'unknown');
+		assert.strictEqual(inferScriptSide('mapped/file.lua', manifest), 'unknown');
 	});
 
 	test('getUsageGroupsForOccurrence splits similar handlers from triggers', () => {

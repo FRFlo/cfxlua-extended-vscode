@@ -1,5 +1,5 @@
 import * as path from 'node:path';
-import { cp, mkdir } from 'node:fs/promises';
+import { cp, mkdir, writeFile } from 'node:fs/promises';
 import * as vscode from 'vscode';
 
 function isMissingPathError(error: unknown): error is NodeJS.ErrnoException {
@@ -21,10 +21,13 @@ async function copyAddonAsset(sourcePath: string, targetPath: string, recursive:
 export async function installAddonAssets(context: vscode.ExtensionContext): Promise<string> {
   const storagePath = context.globalStorageUri.fsPath;
   const addonSourcePath = path.join(context.extensionUri.fsPath, 'plugin');
+  const wrapperPluginSourcePath = path.join(context.extensionUri.fsPath, 'addon', 'plugin.lua');
 
   await mkdir(storagePath, { recursive: true });
-  await copyAddonAsset(path.join(addonSourcePath, 'plugin.lua'), path.join(storagePath, 'plugin.lua'), false);
+  await copyAddonAsset(wrapperPluginSourcePath, path.join(storagePath, 'plugin.lua'), false);
+  await copyAddonAsset(path.join(addonSourcePath, 'plugin.lua'), path.join(storagePath, 'base-plugin.lua'), false);
   await copyAddonAsset(path.join(addonSourcePath, 'library'), path.join(storagePath, 'library'), true);
+  await writeFile(path.join(storagePath, 'analysis-data.lua'), 'return { files = {} }\n', 'utf8');
 
   return storagePath;
 }

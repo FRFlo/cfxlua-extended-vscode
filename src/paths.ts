@@ -2,6 +2,8 @@ import * as path from 'node:path';
 
 export interface AddonPaths {
   pluginFilePath: string;
+  basePluginFilePath: string;
+  analysisDataFilePath: string;
   runtimeLibraryPath: string;
   cfxNativeLibraryPath: string;
   gtavNativeLibraryPath: string;
@@ -13,6 +15,8 @@ export function getAddonPaths(storagePath: string): AddonPaths {
 
   return {
     pluginFilePath: path.join(storagePath, 'plugin.lua'),
+    basePluginFilePath: path.join(storagePath, 'base-plugin.lua'),
+    analysisDataFilePath: path.join(storagePath, 'analysis-data.lua'),
     runtimeLibraryPath: path.join(libraryRootPath, 'runtime'),
     cfxNativeLibraryPath: path.join(libraryRootPath, 'natives', 'CFX-NATIVE'),
     gtavNativeLibraryPath: path.join(libraryRootPath, 'natives', 'GTAV'),

@@ -10,6 +10,8 @@ import {
 import { getSelectedGame } from './configuration';
 import { registerEventIntelligence, WorkspaceEventIndex } from './eventIntelligence';
 import { disableCfxLuaAddon, enableCfxLuaAddon } from './lifecycle';
+import { registerLuaSideEnvironmentSync, refreshLuaSideEnvironment } from './lualsSideEnvironment';
+import { getAddonPaths } from './paths';
 import { ResourcesTreeDataProvider } from './resourcesTreeDataProvider';
 
 let installedStoragePath: string | undefined;
@@ -66,6 +68,9 @@ function registerResourceWatchers(provider: ResourcesTreeDataProvider): vscode.D
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   installedStoragePath = await installAddonAssets(context);
+  const addonPaths = getAddonPaths(installedStoragePath);
+
+  await refreshLuaSideEnvironment(addonPaths);
 
   await activateGame(installedStoragePath, getSelectedGame());
 
@@ -86,6 +91,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     resourcesTreeView,
     resourcesMessageSubscription,
     eventIndexSubscription,
+    registerLuaSideEnvironmentSync(addonPaths),
     registerResourceWatchers(resourcesTreeDataProvider),
     ...registerEventIntelligence(context, eventIndex),
     vscode.commands.registerCommand(COMMAND_USE_GTAV, async () => {

@@ -10,6 +10,7 @@ import {
 	isEventArgumentContext,
 } from '../eventIntelligence';
 import { normalizeGame } from '../game';
+import { extractTopLevelGlobalDeclarations, getExecutionGroupEntries } from '../lualsSideEnvironment';
 import { inferScriptSide, isResourcesDirectoryName } from '../resourceDiscovery';
 import { sanitizeResourceSegment } from '../resourcesTreeDataProvider';
 
@@ -134,6 +135,89 @@ suite('CfxLua helpers', () => {
 		assert.strictEqual(inferScriptSide('nested/file.lua', manifest), 'unknown');
 		assert.strictEqual(inferScriptSide('generated/file.lua', manifest), 'unknown');
 		assert.strictEqual(inferScriptSide('mapped/file.lua', manifest), 'unknown');
+	});
+
+	test('extractTopLevelGlobalDeclarations keeps only bare top-level globals', () => {
+		const declarations = extractTopLevelGlobalDeclarations([
+			'local ignored = true',
+			'ClientState = {}',
+			'function Boot() end',
+			'local function hidden() end',
+			'Nested = function()',
+			'  LocalInside = true',
+			'end',
+			'Config.Value = true',
+			'for i = 1, 3 do',
+			'  LoopGlobal = i',
+			'end',
+		].join('\n'));
+
+		assert.deepStrictEqual(
+			declarations,
+			[
+				{ name: 'Boot', kind: 'function' },
+				{ name: 'ClientState', kind: 'value' },
+				{ name: 'Nested', kind: 'value' },
+			],
+		);
+	});
+
+	test('extractTopLevelGlobalDeclarations supports multi-assignments and comments', () => {
+		const declarations = extractTopLevelGlobalDeclarations([
+			'-- Cached = true',
+			'First, Second = CreateThings()',
+			'--[[ function Blocked() end ]]',
+			'function Third() end',
+		].join('\n'));
+
+		assert.deepStrictEqual(
+			declarations,
+			[
+				{ name: 'First', kind: 'value' },
+				{ name: 'Second', kind: 'value' },
+				{ name: 'Third', kind: 'function' },
+			],
+		);
+	});
+
+	test('getExecutionGroupEntries keeps shared scripts isolated from side-only globals', () => {
+		const resourceRoot = vscode.Uri.file('/tmp/resources/example');
+		const manifestUri = vscode.Uri.file('/tmp/resources/example/fxmanifest.lua');
+		const entries = [
+			{
+				fileUri: vscode.Uri.file('/tmp/resources/example/client.lua'),
+				resourceRoot,
+				manifestUri,
+				scriptSide: 'client' as const,
+			},
+			{
+				fileUri: vscode.Uri.file('/tmp/resources/example/server.lua'),
+				resourceRoot,
+				manifestUri,
+				scriptSide: 'server' as const,
+			},
+			{
+				fileUri: vscode.Uri.file('/tmp/resources/example/shared.lua'),
+				resourceRoot,
+				manifestUri,
+				scriptSide: 'shared' as const,
+			},
+		];
+
+		assert.deepStrictEqual(
+			getExecutionGroupEntries(entries, 'client').map((entry) => entry.fileUri.path),
+			['/tmp/resources/example/client.lua', '/tmp/resources/example/shared.lua'],
+		);
+
+		assert.deepStrictEqual(
+			getExecutionGroupEntries(entries, 'server').map((entry) => entry.fileUri.path),
+			['/tmp/resources/example/server.lua', '/tmp/resources/example/shared.lua'],
+		);
+
+		assert.deepStrictEqual(
+			getExecutionGroupEntries(entries, 'shared').map((entry) => entry.fileUri.path),
+			['/tmp/resources/example/shared.lua'],
+		);
 	});
 
 	test('getUsageGroupsForOccurrence splits similar handlers from triggers', () => {
